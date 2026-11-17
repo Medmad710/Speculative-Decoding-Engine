@@ -155,6 +155,7 @@ class BaselineDecoder:
 
             if current_token in self.eos_ids:
                 # EOS on first token
+                self.last_cache = cache
                 output_ids = torch.cat(
                     [input_ids, torch.tensor([[current_token]], device=self.device)], dim=1
                 )
@@ -186,6 +187,7 @@ class BaselineDecoder:
 
                 current_input = torch.tensor([[next_token]], device=self.device)
 
+        self.last_cache = cache
         output_ids = torch.cat(
             [input_ids, torch.tensor([generated], device=self.device)], dim=1
         )

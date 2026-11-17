@@ -308,6 +308,8 @@ class SpeculativeDecoder:
             generated: List[int] = [first_token]
 
             if first_token in self.eos_ids or max_new_tokens <= 1:
+                self.last_target_cache = target_cache
+                self.last_draft_cache = draft_cache
                 output_ids = torch.cat(
                     [input_ids, torch.tensor([[first_token]], device=self.device)], dim=1
                 )
@@ -406,26 +408,11 @@ class SpeculativeDecoder:
                     if len(generated) >= max_new_tokens:
                         break
 
-                if eos_hit or len(generated) >= max_new_tokens:
-                    break
-
                 # 4. Cache rollback & synchronization
-                if k < g:
-                    # Rejection occurred:
-                    # Confirmed input prefix length in cache is prefix_cache_len + 1 + k
-                    # (corresponds to input tokens: current_token + k accepted tokens)
-                    confirmed_cache_len = prefix_cache_len + 1 + k
-                    crop_cache(target_cache, confirmed_cache_len)
-                    crop_cache(draft_cache, confirmed_cache_len)
-                    # Next token to process as input is the correction token
-                    current_token = torch.tensor([[step_tokens[-1]]], device=self.device)
-                else:
-                    # All g draft tokens accepted:
-                    # Target cache already processed current_token + g tokens (seq_len = prefix_cache_len + 1 + g)
-                    confirmed_cache_len = prefix_cache_len + 1 + g
-                    crop_cache(target_cache, confirmed_cache_len)
+                final_cache_len = prompt_len + len(generated) - 1
 
-                    # Draft cache processed current_token + g - 1 tokens (seq_len = prefix_cache_len + g)
+                if k == g:
+                    # All g draft tokens accepted:
                     # Advance draft cache by feeding the g-th draft token (draft_tokens[-1])
                     last_draft_tok = torch.tensor([[draft_tokens[-1]]], device=self.device)
                     draft_cache_pos = make_cache_position(get_cache_seq_len(draft_cache), 1, self.device)
@@ -435,10 +422,18 @@ class SpeculativeDecoder:
                         use_cache=True,
                         cache_position=draft_cache_pos,
                     )
-                    # Now both draft_cache and target_cache have seq_len == confirmed_cache_len
 
-                    # Next token to process as input is the bonus token
-                    current_token = torch.tensor([[bonus_token]], device=self.device)
+                # Crop both caches to exact final_cache_len (zero off-by-one or uncommitted token leaks)
+                crop_cache(target_cache, final_cache_len)
+                crop_cache(draft_cache, final_cache_len)
+
+                if eos_hit or len(generated) >= max_new_tokens:
+                    break
+
+                current_token = torch.tensor([[generated[-1]]], device=self.device)
+
+        self.last_target_cache = target_cache
+        self.last_draft_cache = draft_cache
 
         output_ids = torch.cat(
             [input_ids, torch.tensor([generated], device=self.device)], dim=1

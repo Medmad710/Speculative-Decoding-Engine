@@ -6,17 +6,17 @@
 
 ## Key Results
 
-> Results on NVIDIA A100 (80 GB) · Qwen3-4B (target) + Qwen3-0.6B (draft) · 256 new tokens · greedy decoding
+> Results on Cloud GPU · Qwen2.5-1.5B (target) + Qwen2.5-0.5B (draft) · 256 new tokens · greedy decoding
 
 | Decoder | γ | Throughput (tok/s) | Speedup | Mean α | TTFT (ms) | Peak VRAM |
 |---------|---|-------------------|---------|--------|-----------|-----------|
-| Baseline | — | ~38 | 1.00× | — | ~290 | ~8.1 GB |
-| Speculative | 2 | ~56 | 1.47× | 0.72 | ~310 | ~9.3 GB |
-| Speculative | 4 | ~71 | 1.87× | 0.69 | ~315 | ~9.3 GB |
-| Speculative | 6 | ~78 | 2.05× | 0.65 | ~320 | ~9.3 GB |
-| Speculative | 8 | ~74 | 1.95× | 0.60 | ~325 | ~9.3 GB |
+| Baseline | — | TBD (T4 GPU) | 1.00× | — | TBD (T4 GPU) | TBD (T4 GPU) |
+| Speculative | 2 | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) |
+| Speculative | 4 | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) |
+| Speculative | 6 | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) |
+| Speculative | 8 | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) | TBD (T4 GPU) |
 
-> *Note: results on your hardware will vary. Run `benchmarks/run_benchmark.py` to reproduce.*
+> *Run `notebooks/run_gpu_benchmark.ipynb` in Google Colab / Kaggle to populate this table on real hardware.*
 
 ### Charts
 
@@ -77,7 +77,7 @@
         ┌────────────────────────────────────────────┐
         │             CACHE ROLLBACK                 │
         │                                            │
-        │  Crop target cache: N - 1 + γ  →  N-1+k  │
+        │  Crop target cache: N + γ      →  N - 1 + k│
         │  Crop draft  cache: N - 1 + γ  →  N-1+k  │
         │                                            │
         │  Feed bonus token through both models      │
@@ -145,7 +145,7 @@ speculative-decoding-engine/
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/speculative-decoding-engine.git
+git clone https://github.com/Medmad710/Speculative-Decoding-Engine.git
 cd speculative-decoding-engine
 pip install -r requirements.txt
 ```
