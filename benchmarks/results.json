@@ -1,0 +1,66 @@
+{
+  "meta": {
+    "target_model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "draft_model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "device": "cpu",
+    "dtype": "torch.float32",
+    "max_new_tokens": 64,
+    "gamma_values": [
+      2,
+      4
+    ],
+    "temperature": 0.0
+  },
+  "baseline": [
+    {
+      "decoder_type": "baseline",
+      "domain": "code",
+      "prompt_preview": "Write a Python function that implements merge sort on a list",
+      "gamma": null,
+      "throughput_tps": 4.795,
+      "speedup_ratio": 1.0,
+      "ttft_ms": 1066.656,
+      "elapsed_s": 13.3462,
+      "total_tokens": 64,
+      "prompt_tokens": 51,
+      "mean_acceptance_rate": null,
+      "mean_accepted_per_step": null,
+      "total_steps": null,
+      "peak_vram_mb": 0.0
+    }
+  ],
+  "speculative": [
+    {
+      "decoder_type": "speculative",
+      "domain": "code",
+      "prompt_preview": "Write a Python function that implements merge sort on a list",
+      "gamma": 2,
+      "throughput_tps": 4.943,
+      "speedup_ratio": 1.031,
+      "ttft_ms": 1478.558,
+      "elapsed_s": 12.9468,
+      "total_tokens": 64,
+      "prompt_tokens": 51,
+      "mean_acceptance_rate": 0.8696,
+      "mean_accepted_per_step": 2.7826,
+      "total_steps": 23,
+      "peak_vram_mb": 0.0
+    },
+    {
+      "decoder_type": "speculative",
+      "domain": "code",
+      "prompt_preview": "Write a Python function that implements merge sort on a list",
+      "gamma": 4,
+      "throughput_tps": 5.427,
+      "speedup_ratio": 1.132,
+      "ttft_ms": 1441.427,
+      "elapsed_s": 11.792,
+      "total_tokens": 64,
+      "prompt_tokens": 51,
+      "mean_acceptance_rate": 0.7231,
+      "mean_accepted_per_step": 3.7647,
+      "total_steps": 17,
+      "peak_vram_mb": 0.0
+    }
+  ]
+}
