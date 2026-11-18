@@ -1,12 +1,12 @@
 # Speculative Decoding Engine
 
-> **Production-grade, from-scratch implementation of lossless speculative decoding in PyTorch** (Leviathan et al. 2023 / Chen et al. 2023), with manual `DynamicCache` management and full benchmark infrastructure.
+> **High-performance, from-scratch implementation of lossless speculative decoding in PyTorch** (Leviathan et al. 2023 / Chen et al. 2023), with manual `DynamicCache` management and full benchmark infrastructure.
 
 ---
 
 ## Key Results
 
-> **Optimized run on NVIDIA Tesla T4 GPU (Google Colab)** · Qwen3-4B (target) + Qwen3-0.6B (draft) · `float16` (native T4 FP16 Tensor Cores) · SDPA attention · `torch.compile(dynamic=True)` · 256 new tokens · greedy decoding · 12 diverse prompts.
+> **Optimized run on NVIDIA Tesla T4 GPU (Google Colab)** · Qwen3-4B (target) + Qwen3-0.6B (draft) · `float16` (native T4 FP16 Tensor Cores) · SDPA attention · `torch.compile(dynamic=True)` · 256 new tokens · greedy decoding (`batch_size=1`) · 12 diverse prompts.
 
 | Decoder | γ | Throughput (tok/s) | Speedup | Mean Acceptance (α) | Avg Accepted / Step | TTFT (ms) | Peak VRAM |
 |---------|---|-------------------|---------|---------------------|---------------------|-----------|-----------|
@@ -25,12 +25,12 @@
 | **General Text** | 4 | 1.05× | 25.9 | 50.3% |
 
 > [!NOTE]
-> **What the optimizations achieved vs. the previous run (BF16 eager mode):**
+> **Key Takeaways & Optimization Impact (vs. initial BF16 eager baseline):**
 > - **Baseline throughput jumped from 13.6 → 25.0 tok/s (+84%)** — purely from switching BF16 (FP32-emulated on T4) to native FP16 Tensor Cores + SDPA + `torch.compile`.
-> - **Speculative decoding now achieves a real wall-clock speedup of 1.03×–1.23×** (vs. 0.50×–0.56× before), confirming the optimization target is met.
-> - **Peak speedup on individual Math prompts: 1.74×**, which falls squarely in the target 1.6×–2.2× range.
-> - **General Text remains the hardest domain** (α ≈ 32–63%): lower draft acceptance means more correction overhead. This is expected and consistent with the literature (Leviathan et al. 2023).
-> - On **A100/H100 with 14B–70B models**, the same 80% reduction in target forward passes (256 → 42–54 steps) would translate directly into **>2.5× wall-clock speedup** due to higher memory bandwidth and larger per-step compute savings.
+> - **Speculative decoding achieves a consistent wall-clock speedup of 1.03×–1.23×** (up from 0.50×–0.56× before kernel/precision optimizations). Slightly higher TTFT (~58–60 ms vs. 51.6 ms) reflects parallel prompt prefill across both target and draft models.
+> - **Peak speedup on individual Math prompts reaches 1.74×**, falling squarely within the expected range for memory-bound autoregressive generation.
+> - **General Text remains the hardest domain** ($\alpha \approx 32\text{--}63\%$): higher token entropy leads to lower draft acceptance and more rollback overhead, consistent with Leviathan et al. (2023).
+> - **Scaling Projection:** Based on the ~80% reduction in target forward passes (256 → 42–54 steps) and the theoretical speedup model below, deploying this pipeline on memory-bandwidth-bound **A100/H100 GPUs with 14B–70B target models** is projected to yield **>2.5× wall-clock speedup**.
 
 ### Charts
 
