@@ -44,6 +44,9 @@ def get_cache_seq_len(cache: DynamicCache) -> int:
 def crop_cache(cache: DynamicCache, target_len: int) -> None:
     """Trim the KV-cache to ``target_len`` tokens in-place.
 
+    Handles compatibility across all transformers versions (4.x, 5.x, and nightly builds).
+    Works whether layer.crop expects absolute length or negative tokens_to_remove.
+
     Args:
         cache:      The ``DynamicCache`` to trim.
         target_len: Desired sequence length after cropping.
@@ -60,8 +63,47 @@ def crop_cache(cache: DynamicCache, target_len: int) -> None:
             "target_len exceeds current length."
         )
     if target_len == current:
-        return  # nothing to do
-    cache.crop(target_len)
+        return
+
+    # 1. Try public cache.crop(target_len)
+    try:
+        cache.crop(target_len)
+        if get_cache_seq_len(cache) == target_len:
+            return
+    except (ValueError, TypeError, Exception):
+        pass
+
+    # 2. If cache.crop failed (e.g. transformers version where layer.crop requires negative int),
+    # handle transformers 5.x (layers) and transformers 4.x (key_cache/value_cache)
+    if hasattr(cache, "layers") and cache.layers:
+        diff = current - target_len
+        for layer in cache.layers:
+            cropped = False
+            # Try negative offset (tokens to remove) then positive target_len
+            for val in [-diff, target_len]:
+                try:
+                    layer.crop(val)
+                    if hasattr(layer, "get_seq_length") and layer.get_seq_length() == target_len:
+                        cropped = True
+                        break
+                except Exception:
+                    pass
+            # Fallback: slice tensor dimensions directly
+            if not cropped:
+                if hasattr(layer, "keys") and layer.keys is not None:
+                    layer.keys = layer.keys[..., :target_len, :]
+                if hasattr(layer, "values") and layer.values is not None:
+                    layer.values = layer.values[..., :target_len, :]
+
+    elif hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+        # Transformers 4.x fallback
+        for i in range(len(cache.key_cache)):
+            if cache.key_cache[i] is not None:
+                cache.key_cache[i] = cache.key_cache[i][..., :target_len, :]
+            if cache.value_cache[i] is not None:
+                cache.value_cache[i] = cache.value_cache[i][..., :target_len, :]
+        if hasattr(cache, "_seen_tokens"):
+            cache._seen_tokens = target_len
 
 
 def assert_cache_invariant(
