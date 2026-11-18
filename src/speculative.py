@@ -89,6 +89,7 @@ class SpeculativeDecoder:
         target_model:   Large target model (eval mode).
         tokenizer:      Shared tokenizer.
         device:         Target device (inferred from target_model if not given).
+        compile:        If True, compile models with torch.compile(dynamic=True).
     """
 
     def __init__(
@@ -97,11 +98,22 @@ class SpeculativeDecoder:
         target_model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
         device: Optional[torch.device] = None,
+        compile: bool = False,
     ):
         self.draft_model = draft_model
         self.target_model = target_model
         self.tokenizer = tokenizer
         self.device = device or next(target_model.parameters()).device
+        self.compiled = False
+
+        if compile:
+            try:
+                self.draft_model = torch.compile(self.draft_model, dynamic=True)
+                self.target_model = torch.compile(self.target_model, dynamic=True)
+                self.compiled = True
+            except Exception as e:
+                self.compiled = False
+
         self.eos_ids: Set[int] = self._collect_eos_ids()
 
     def _collect_eos_ids(self) -> Set[int]:
@@ -142,8 +154,8 @@ class SpeculativeDecoder:
     def _sample_from_probs(
         probs: torch.Tensor,
         generator: Optional[torch.Generator],
-    ) -> int:
-        return int(torch.multinomial(probs, num_samples=1, generator=generator))
+    ) -> torch.Tensor:
+        return torch.multinomial(probs, num_samples=1, generator=generator)
 
     @staticmethod
     def _adjusted_residual(
@@ -165,8 +177,9 @@ class SpeculativeDecoder:
         temperature: float,
         top_p: float,
         generator: Optional[torch.Generator],
-    ) -> Tuple[List[int], List[torch.Tensor]]:
-        draft_tokens: List[int] = []
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Generate gamma draft tokens asynchronously on device without per-token CPU round trips."""
+        draft_token_tensors: List[torch.Tensor] = []
         draft_probs: List[torch.Tensor] = []
 
         inp = current_token.to(self.device)
@@ -181,50 +194,40 @@ class SpeculativeDecoder:
                 use_cache=True,
                 cache_position=cache_pos,
             )
-            logits = out.logits[0, -1, :]
-            probs = self._probs_from_logits(logits, temperature, top_p)
-
             if temperature == 0.0:
-                token = int(probs.argmax())
+                next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             else:
-                token = self._sample_from_probs(probs, generator)
+                logits = out.logits[0, -1, :]
+                probs = self._probs_from_logits(logits, temperature, top_p)
+                next_tok = self._sample_from_probs(probs, generator).view(1, 1)
+                draft_probs.append(probs)
 
-            draft_tokens.append(token)
-            draft_probs.append(probs)
-            inp = torch.tensor([[token]], device=self.device)
+            draft_token_tensors.append(next_tok)
+            inp = next_tok
 
-        return draft_tokens, draft_probs
+        draft_tokens_tensor = torch.cat(draft_token_tensors, dim=1)  # (1, gamma)
+        return draft_tokens_tensor, draft_probs
 
     @torch.inference_mode()
     def _verify_tokens(
         self,
         current_token: torch.Tensor,
-        draft_tokens: List[int],
+        draft_tokens_tensor: torch.Tensor,
         target_cache: DynamicCache,
-        temperature: float,
-        top_p: float,
-    ) -> List[torch.Tensor]:
-        all_tokens = [current_token.item()] + draft_tokens
-        input_ids = torch.tensor([all_tokens], device=self.device)
-
+    ) -> torch.Tensor:
+        """Run single parallel verification forward pass on device."""
+        all_tokens = torch.cat([current_token, draft_tokens_tensor], dim=1)  # (1, gamma + 1)
         seq_in_cache = get_cache_seq_len(target_cache)
-        gamma_plus_1 = len(all_tokens)
+        gamma_plus_1 = all_tokens.shape[1]
         cache_pos = make_cache_position(seq_in_cache, gamma_plus_1, self.device)
 
         out = self.target_model(
-            input_ids=input_ids,
+            input_ids=all_tokens,
             past_key_values=target_cache,
             use_cache=True,
             cache_position=cache_pos,
         )
-        logits = out.logits[0]
-
-        target_probs: List[torch.Tensor] = []
-        for i in range(logits.shape[0]):
-            p = self._probs_from_logits(logits[i], temperature, top_p)
-            target_probs.append(p)
-
-        return target_probs
+        return out.logits[0]  # (gamma + 1, vocab)
 
     @torch.inference_mode()
     def _prefill(
@@ -263,20 +266,7 @@ class SpeculativeDecoder:
         seed: int = 42,
         track_metrics: bool = False,
     ) -> Tuple[torch.Tensor, Optional[BenchmarkResult]]:
-        """Run speculative decoding.
-
-        Args:
-            input_ids:      Prompt token IDs, shape (1, prompt_len).
-            max_new_tokens: Maximum new tokens to generate.
-            gamma:          Draft window size.
-            temperature:    Sampling temperature (0.0 = greedy).
-            top_p:          Nucleus sampling threshold.
-            seed:           RNG seed.
-            track_metrics:  Return a populated BenchmarkResult.
-
-        Returns:
-            (output_ids, result)
-        """
+        """Run speculative decoding with zero per-token CPU round trips."""
         input_ids = input_ids.to(self.device)
         prompt_len = input_ids.shape[1]
 
@@ -294,153 +284,163 @@ class SpeculativeDecoder:
         total_proposed_draft = 0
         total_steps = 0
 
+        eos_tensor = torch.tensor(list(self.eos_ids), device=self.device, dtype=torch.long)
+
         with total_timer:
             # Prefill phase
             with ttft_timer:
                 draft_cache, target_cache, prefill_logits = self._prefill(input_ids)
 
             if temperature == 0.0:
-                first_token = int(prefill_logits.argmax())
+                first_token = prefill_logits.argmax().view(1, 1)
             else:
                 first_probs = self._probs_from_logits(prefill_logits, temperature, top_p)
-                first_token = self._sample_from_probs(first_probs, generator)
+                first_token = self._sample_from_probs(first_probs, generator).view(1, 1)
 
-            generated: List[int] = [first_token]
+            generated_tensors: List[torch.Tensor] = [first_token.view(-1)]
+            current_generated_len = 1
 
-            if first_token in self.eos_ids or max_new_tokens <= 1:
+            if bool(torch.isin(first_token, eos_tensor).item()) or max_new_tokens <= 1:
                 self.last_target_cache = target_cache
                 self.last_draft_cache = draft_cache
-                output_ids = torch.cat(
-                    [input_ids, torch.tensor([[first_token]], device=self.device)], dim=1
-                )
+                all_generated = torch.cat(generated_tensors, dim=0)
+                output_ids = torch.cat([input_ids, all_generated.unsqueeze(0)], dim=1)
+                generated_list = all_generated.cpu().tolist()
                 result = self._make_result(
                     track_metrics, ttft_timer, total_timer,
-                    prompt_len, generated, 0, 0, 0, gamma
+                    prompt_len, generated_list, 0, 0, 0, gamma
                 )
                 return output_ids, result
 
-            current_token = torch.tensor([[first_token]], device=self.device)
+            current_token = first_token  # shape (1, 1) on device
 
-            # Speculative decoding loop
-            while len(generated) < max_new_tokens:
-                remaining = max_new_tokens - len(generated)
+            # Speculative decoding loop (hot loop kept on device)
+            while current_generated_len < max_new_tokens:
+                remaining = max_new_tokens - current_generated_len
                 g = min(gamma, remaining)
                 total_steps += 1
                 total_proposed_draft += g
 
-                # Cache length before step = prompt_len + len(generated) - 1
-                prefix_cache_len = get_cache_seq_len(target_cache)
-
                 # 1. Draft phase
-                draft_tokens, draft_probs = self._draft_tokens(
+                draft_tokens_tensor, draft_probs = self._draft_tokens(
                     current_token, draft_cache, g, temperature, top_p, generator
                 )
 
                 # 2. Verify phase (target parallel forward pass)
-                target_probs = self._verify_tokens(
-                    current_token, draft_tokens, target_cache, temperature, top_p
+                target_logits = self._verify_tokens(
+                    current_token, draft_tokens_tensor, target_cache
                 )
 
-                # 3. Rejection sampling
-                accepted_tokens: List[int] = []
-                correction_token: Optional[int] = None
-                bonus_token: Optional[int] = None
-                eos_hit = False
+                # 3. Rejection sampling / verification
+                if temperature == 0.0:
+                    target_preds = target_logits.argmax(dim=-1)  # (g + 1,)
+                    draft_1d = draft_tokens_tensor[0]            # (g,)
+                    matches = (draft_1d == target_preds[:g])     # (g,) bool
 
-                for i in range(g):
-                    d_i = draft_tokens[i]
-                    p_t = target_probs[i]
-                    p_d = draft_probs[i]
+                    cum_matches = torch.cumprod(matches.to(torch.long), dim=0)
+                    k = int(cum_matches.sum().item())
+                    total_accepted_draft += k
 
-                    if temperature == 0.0:
-                        t_tok = int(p_t.argmax())
-                        if t_tok == d_i:
-                            accepted_tokens.append(d_i)
-                            if d_i in self.eos_ids:
-                                eos_hit = True
-                                break
-                        else:
-                            correction_token = t_tok
-                            if correction_token in self.eos_ids:
-                                eos_hit = True
-                            break
-                    else:
-                        p_t_di = float(p_t[d_i].clamp(min=0.0))
-                        p_d_di = float(p_d[d_i].clamp(min=1e-9))
+                    # Token at position k in target_preds is the next token:
+                    # bonus token if k == g, or correction token if k < g
+                    step_tokens = torch.cat([draft_1d[:k], target_preds[k : k + 1]])
+
+                else:
+                    target_probs: List[torch.Tensor] = []
+                    for i in range(g + 1):
+                        target_probs.append(self._probs_from_logits(target_logits[i], temperature, top_p))
+
+                    accepted_tokens: List[torch.Tensor] = []
+                    correction_token: Optional[torch.Tensor] = None
+                    bonus_token: Optional[torch.Tensor] = None
+                    eos_hit_stoch = False
+
+                    for i in range(g):
+                        d_i = draft_tokens_tensor[0, i : i + 1]
+                        d_i_int = int(d_i.item())
+                        p_t = target_probs[i]
+                        p_d = draft_probs[i]
+
+                        p_t_di = float(p_t[d_i_int].clamp(min=0.0))
+                        p_d_di = float(p_d[d_i_int].clamp(min=1e-9))
                         accept_prob = min(1.0, p_t_di / p_d_di)
 
                         u = float(torch.rand(1, generator=generator).item())
                         if u <= accept_prob:
                             accepted_tokens.append(d_i)
-                            if d_i in self.eos_ids:
-                                eos_hit = True
+                            if d_i_int in self.eos_ids:
+                                eos_hit_stoch = True
                                 break
                         else:
                             residual = self._adjusted_residual(p_t, p_d)
-                            correction_token = self._sample_from_probs(residual, generator)
-                            if correction_token in self.eos_ids:
-                                eos_hit = True
+                            corr = self._sample_from_probs(residual, generator)
+                            correction_token = corr.view(1)
+                            if int(correction_token.item()) in self.eos_ids:
+                                eos_hit_stoch = True
                             break
 
-                k = len(accepted_tokens)
-                total_accepted_draft += k
+                    k = len(accepted_tokens)
+                    total_accepted_draft += k
 
-                # Bonus token if all g accepted and no EOS
-                if k == g and not eos_hit:
-                    p_bonus = target_probs[g]
-                    if temperature == 0.0:
-                        bonus_token = int(p_bonus.argmax())
-                    else:
-                        bonus_token = self._sample_from_probs(p_bonus, generator)
-                    if bonus_token in self.eos_ids:
-                        eos_hit = True
+                    if k == g and not eos_hit_stoch:
+                        p_bonus = target_probs[g]
+                        bonus_token = self._sample_from_probs(p_bonus, generator).view(1)
 
-                # Determine tokens emitted this step
-                step_tokens = list(accepted_tokens)
-                if correction_token is not None:
-                    step_tokens.append(correction_token)
-                elif bonus_token is not None:
-                    step_tokens.append(bonus_token)
+                    step_parts = list(accepted_tokens)
+                    if correction_token is not None:
+                        step_parts.append(correction_token)
+                    elif bonus_token is not None:
+                        step_parts.append(bonus_token)
+                    step_tokens = torch.cat(step_parts, dim=0)
 
-                # Append to generated sequence (respecting max_new_tokens)
-                for tok in step_tokens:
-                    generated.append(tok)
-                    if len(generated) >= max_new_tokens:
-                        break
+                # 4. Check EOS on step_tokens
+                is_eos = torch.isin(step_tokens, eos_tensor)
+                if bool(is_eos.any().item()):
+                    eos_idx = int(torch.nonzero(is_eos)[0, 0].item())
+                    step_tokens = step_tokens[: eos_idx + 1]
+                    eos_hit = True
+                else:
+                    eos_hit = False
 
-                # 4. Cache rollback & synchronization
-                final_cache_len = prompt_len + len(generated) - 1
+                # 5. Respect max_new_tokens
+                if current_generated_len + step_tokens.shape[0] > max_new_tokens:
+                    allowed = max_new_tokens - current_generated_len
+                    step_tokens = step_tokens[:allowed]
 
+                num_emitted = step_tokens.shape[0]
+                current_generated_len += num_emitted
+                final_cache_len = prompt_len + current_generated_len - 1
+
+                # 6. Cache rollback & synchronization
                 if k == g:
-                    # All g draft tokens accepted:
-                    # Advance draft cache by feeding the g-th draft token (draft_tokens[-1])
-                    last_draft_tok = torch.tensor([[draft_tokens[-1]]], device=self.device)
-                    draft_cache_pos = make_cache_position(get_cache_seq_len(draft_cache), 1, self.device)
+                    last_draft_tok = draft_tokens_tensor[0, -1:].view(1, 1)
+                    draft_pos = make_cache_position(get_cache_seq_len(draft_cache), 1, self.device)
                     _ = self.draft_model(
                         input_ids=last_draft_tok,
                         past_key_values=draft_cache,
                         use_cache=True,
-                        cache_position=draft_cache_pos,
+                        cache_position=draft_pos,
                     )
 
-                # Crop both caches to exact final_cache_len (zero off-by-one or uncommitted token leaks)
                 crop_cache(target_cache, final_cache_len)
                 crop_cache(draft_cache, final_cache_len)
 
-                if eos_hit or len(generated) >= max_new_tokens:
-                    break
+                generated_tensors.append(step_tokens)
+                current_token = step_tokens[-1:].view(1, 1)
 
-                current_token = torch.tensor([[generated[-1]]], device=self.device)
+                if eos_hit or current_generated_len >= max_new_tokens:
+                    break
 
         self.last_target_cache = target_cache
         self.last_draft_cache = draft_cache
 
-        output_ids = torch.cat(
-            [input_ids, torch.tensor([generated], device=self.device)], dim=1
-        )
+        all_generated = torch.cat(generated_tensors, dim=0)
+        output_ids = torch.cat([input_ids, all_generated.unsqueeze(0)], dim=1)
+        generated_list = all_generated.cpu().tolist()
+
         result = self._make_result(
             track_metrics, ttft_timer, total_timer,
-            prompt_len, generated, total_accepted_draft, total_proposed_draft, total_steps, gamma
+            prompt_len, generated_list, total_accepted_draft, total_proposed_draft, total_steps, gamma
         )
         return output_ids, result
 

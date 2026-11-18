@@ -47,23 +47,34 @@ from benchmarks.prompts import get_all_prompts
 # ---------------------------------------------------------------------------
 
 def detect_hardware() -> Tuple[torch.device, str, str, torch.dtype]:
-    """Detect available hardware and choose appropriate model pair.
+    """Detect available hardware and choose appropriate model pair and precision.
 
     Returns:
         (device, target_model_id, draft_model_id, dtype)
     """
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(f"[hw] CUDA detected — GPU: {torch.cuda.get_device_name(0)}, "
+        props = torch.cuda.get_device_properties(0)
+        total_vram_gb = props.total_memory / (1024 ** 3)
+        major, minor = torch.cuda.get_device_capability(0)
+        print(f"[hw] CUDA detected — GPU: {props.name} (Compute Capability {major}.{minor}), "
               f"VRAM: {total_vram_gb:.1f} GB")
 
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # Hardware-aware precision:
+        # Use bfloat16 ONLY on Ampere or newer GPUs (Compute Capability major >= 8, e.g. A100, H100, RTX 3090/4090).
+        # On Turing/Volta (major < 8, e.g. Tesla T4, V100, RTX 2080), strictly use float16
+        # to leverage native FP16 Tensor Cores instead of slow FP32-emulated BF16.
+        if major >= 8 and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+            print("[hw] Compute capability >= 8.0 → using native torch.bfloat16")
+        else:
+            dtype = torch.float16
+            print("[hw] Compute capability < 8.0 (Turing/Volta) → using native torch.float16")
 
         if total_vram_gb >= 12.0:
             target = "Qwen/Qwen3-4B"
             draft = "Qwen/Qwen3-0.6B"
-            print(f"[hw] ≥12 GB VRAM → using {target} + {draft}")
+            print(f"[hw] ≥12 GB VRAM → using {target} + {draft} (~9.2 GB total in float16)")
         else:
             target = "Qwen/Qwen2.5-1.5B-Instruct"
             draft = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -96,7 +107,7 @@ def load_models(
     device: torch.device,
     dtype: torch.dtype,
 ):
-    """Load tokenizer and both models."""
+    """Load tokenizer and both models with SDPA attention."""
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
     print(f"\n[load] Tokenizer from {target_model_id}...")
@@ -104,15 +115,25 @@ def load_models(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"[load] Draft model {draft_model_id}...")
-    draft_model = AutoModelForCausalLM.from_pretrained(
-        draft_model_id, torch_dtype=dtype
-    ).to(device).eval()
+    def _load_single_model(model_id: str):
+        try:
+            return AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                attn_implementation="sdpa",
+            ).to(device).eval()
+        except Exception as e:
+            print(f"[load] SDPA load note for {model_id} ({e}), loading standard attention...")
+            return AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+            ).to(device).eval()
 
-    print(f"[load] Target model {target_model_id}...")
-    target_model = AutoModelForCausalLM.from_pretrained(
-        target_model_id, torch_dtype=dtype
-    ).to(device).eval()
+    print(f"[load] Draft model {draft_model_id} (attn_implementation=sdpa)...")
+    draft_model = _load_single_model(draft_model_id)
+
+    print(f"[load] Target model {target_model_id} (attn_implementation=sdpa)...")
+    target_model = _load_single_model(target_model_id)
 
     print("[load] Models ready.\n")
     return tokenizer, draft_model, target_model
@@ -253,6 +274,12 @@ def main():
     parser.add_argument("--smoke", action="store_true",
                         help="Quick smoke test: 1 prompt, gamma=[2,4], max=64")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable torch.compile(dynamic=True) (default: True on CUDA, False on CPU/MPS)",
+    )
     args = parser.parse_args()
 
     # Hardware
@@ -260,14 +287,20 @@ def main():
     target_model_id = args.target_model or auto_target
     draft_model_id = args.draft_model or auto_draft
 
+    # Determine compile flag (default: True on CUDA, False on CPU/MPS)
+    use_compile = (device.type == "cuda") if args.compile is None else args.compile
+    print(f"[compile] torch.compile(dynamic=True): {'ENABLED' if use_compile else 'DISABLED'}")
+
     # Load models
     tokenizer, draft_model, target_model = load_models(
         target_model_id, draft_model_id, device, dtype
     )
 
-    # Instantiate decoders
-    baseline = BaselineDecoder(target_model, tokenizer, device=device)
-    speculative = SpeculativeDecoder(draft_model, target_model, tokenizer, device=device)
+    # Instantiate decoders with optional compilation
+    baseline = BaselineDecoder(target_model, tokenizer, device=device, compile=use_compile)
+    speculative = SpeculativeDecoder(
+        draft_model, target_model, tokenizer, device=device, compile=use_compile
+    )
 
     # Benchmark params
     gamma_values = [2, 4] if args.smoke else args.gamma
@@ -316,6 +349,7 @@ def main():
             "max_new_tokens": max_new_tokens,
             "gamma_values": gamma_values,
             "temperature": args.temperature,
+            "compile": use_compile,
         },
         "baseline": all_baseline,
         "speculative": all_spec,

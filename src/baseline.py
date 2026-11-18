@@ -29,6 +29,7 @@ class BaselineDecoder:
         model:     A HuggingFace causal-LM (already on device, eval mode).
         tokenizer: Matching tokenizer (for EOS detection).
         device:    Target device (inferred from model if not given).
+        compile:   If True, compile the model forward pass with torch.compile(dynamic=True).
     """
 
     def __init__(
@@ -36,10 +37,19 @@ class BaselineDecoder:
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
         device: Optional[torch.device] = None,
+        compile: bool = False,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device or next(model.parameters()).device
+        self.compiled = False
+
+        if compile:
+            try:
+                self.model = torch.compile(self.model, dynamic=True)
+                self.compiled = True
+            except Exception as e:
+                self.compiled = False
 
         # Collect all EOS token ids (handles both eos_token_id and <|im_end|>)
         self.eos_ids: set[int] = self._collect_eos_ids()
@@ -129,6 +139,9 @@ class BaselineDecoder:
             generator = torch.Generator(device=self.device)
             generator.manual_seed(seed)
 
+        # Collect EOS tensor for fast device checks
+        eos_tensor = torch.tensor(list(self.eos_ids), device=self.device, dtype=torch.long)
+
         # Reset VRAM stats
         reset_peak_vram(self.device)
 
@@ -148,26 +161,28 @@ class BaselineDecoder:
                     cache_position=cache_pos,
                 )
             # cache now has seq_len = prompt_len
-            last_logits = out.logits[0, -1, :]  # (vocab,)
-            current_token = self._sample_token(last_logits, temperature, top_p, generator)
+            if temperature == 0.0:
+                current_input = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            else:
+                last_logits = out.logits[0, -1, :]
+                tok_int = self._sample_token(last_logits, temperature, top_p, generator)
+                current_input = torch.tensor([[tok_int]], device=self.device)
 
-            generated: list[int] = [current_token]
+            generated_tensors: list[torch.Tensor] = [current_input.view(-1)]
 
-            if current_token in self.eos_ids:
-                # EOS on first token
+            if bool(torch.isin(current_input, eos_tensor).item()) or max_new_tokens <= 1:
+                # EOS on first token or max_new_tokens is 1
                 self.last_cache = cache
-                output_ids = torch.cat(
-                    [input_ids, torch.tensor([[current_token]], device=self.device)], dim=1
-                )
+                all_generated = torch.cat(generated_tensors, dim=0)
+                output_ids = torch.cat([input_ids, all_generated.unsqueeze(0)], dim=1)
+                generated_list = all_generated.cpu().tolist()
                 result = self._make_result(
                     track_metrics, ttft_timer, total_timer,
-                    prompt_len, generated
+                    prompt_len, generated_list
                 )
                 return output_ids, result
 
-            # ----- Decode: one token at a time -----
-            current_input = torch.tensor([[current_token]], device=self.device)
-
+            # ----- Decode: one token at a time (pure tensor loop) -----
             for _ in range(max_new_tokens - 1):
                 seq_len_in_cache = get_cache_seq_len(cache)
                 cache_pos = make_cache_position(seq_len_in_cache, 1, self.device)
@@ -178,21 +193,25 @@ class BaselineDecoder:
                     use_cache=True,
                     cache_position=cache_pos,
                 )
-                last_logits = out.logits[0, -1, :]
-                next_token = self._sample_token(last_logits, temperature, top_p, generator)
-                generated.append(next_token)
+                if temperature == 0.0:
+                    next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                else:
+                    last_logits = out.logits[0, -1, :]
+                    tok_int = self._sample_token(last_logits, temperature, top_p, generator)
+                    next_token = torch.tensor([[tok_int]], device=self.device)
 
-                if next_token in self.eos_ids:
+                generated_tensors.append(next_token.view(-1))
+                current_input = next_token
+
+                if bool(torch.isin(next_token, eos_tensor).item()):
                     break
 
-                current_input = torch.tensor([[next_token]], device=self.device)
-
         self.last_cache = cache
-        output_ids = torch.cat(
-            [input_ids, torch.tensor([generated], device=self.device)], dim=1
-        )
+        all_generated = torch.cat(generated_tensors, dim=0)
+        output_ids = torch.cat([input_ids, all_generated.unsqueeze(0)], dim=1)
+        generated_list = all_generated.cpu().tolist()
         result = self._make_result(
-            track_metrics, ttft_timer, total_timer, prompt_len, generated
+            track_metrics, ttft_timer, total_timer, prompt_len, generated_list
         )
         return output_ids, result
 

@@ -160,7 +160,7 @@ pip install -r requirements.txt
 ### 1. Run the full test suite
 
 ```bash
-pytest tests/ -v
+PYTHONPATH=. pytest tests/ -v
 ```
 
 Expected output:
@@ -169,7 +169,7 @@ tests/test_equivalence.py::TestGreedyEquivalence::test_greedy_equivalence[gamma=
 tests/test_equivalence.py::TestGreedyEquivalence::test_greedy_equivalence[gamma=3-...] PASSED
 tests/test_equivalence.py::TestGreedyEquivalence::test_greedy_equivalence[gamma=5-...] PASSED
 ...
-========= N passed in Xs =========
+========= 21 passed in 10s =========
 ```
 
 ### 2. Quick smoke benchmark (CPU-safe, ~2 min)
@@ -182,6 +182,7 @@ python benchmarks/run_benchmark.py --smoke
 
 ```bash
 python benchmarks/run_benchmark.py \
+    --compile \
     --max-new-tokens 256 \
     --gamma 2 4 6 8 \
     --warmup 2
@@ -230,15 +231,22 @@ This invariant is enforced via `cache.crop(target_len)` (not direct attribute mu
 | Explicit `cache_position` on every call | Prevents RoPE position desync after crop |
 | `cache.crop(n)` via public API | Version-stable; never touches `_seen_tokens` directly |
 | Single parallel verify pass | True to the paper; full throughput benefit |
+| Zero hot-loop syncs | Eliminates CPU-GPU `.item()` / `.cpu()` synchronizations in generation loops |
+| Native FP16 on Turing (T4) | Utilizes native FP16 Tensor Cores instead of slow FP32-emulated BF16 |
+| SDPA attention (`attn_implementation="sdpa"`) | Fused Flash/Memory-Efficient Attention for maximum bandwidth efficiency |
+| `torch.compile(dynamic=True)` | Fuses PyTorch execution graph, eliminating Python kernel launch overhead |
 | `enable_thinking=False` for Qwen3 | Suppresses `<think>` reasoning blocks in outputs |
 | `torch.Generator` with fixed seed | Reproducible stochastic sampling across runs |
 
-### Hardware Auto-Detection
+### Hardware-Aware Precision & Model Auto-Detection
 
-| Condition | Target | Draft | dtype |
-|-----------|--------|-------|-------|
-| CUDA ≥ 12 GB VRAM | Qwen3-4B | Qwen3-0.6B | bfloat16 |
-| CUDA < 12 GB / CPU / MPS | Qwen2.5-1.5B-Instruct | Qwen2.5-0.5B-Instruct | float16 / float32 |
+| GPU Architecture / Hardware | Target Model | Draft Model | Precision (`torch_dtype`) | Attn Implementation |
+|-----------------------------|--------------|-------------|--------------------------|---------------------|
+| **Ampere / Hopper (CUDA major ≥ 8, ≥ 12 GB)** | Qwen3-4B | Qwen3-0.6B | `torch.bfloat16` (Native BF16) | SDPA |
+| **Turing / Volta (Tesla T4, major < 8, ≥ 12 GB)** | Qwen3-4B | Qwen3-0.6B | `torch.float16` (Native FP16) | SDPA |
+| **CUDA < 12 GB VRAM** | Qwen2.5-1.5B | Qwen2.5-0.5B | `torch.float16` | SDPA |
+| **Apple Silicon (MPS)** | Qwen2.5-1.5B | Qwen2.5-0.5B | `torch.float16` | SDPA |
+| **CPU-only** | Qwen2.5-1.5B | Qwen2.5-0.5B | `torch.float32` | Standard |
 
 ---
 
