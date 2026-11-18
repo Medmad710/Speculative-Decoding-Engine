@@ -65,21 +65,23 @@ def crop_cache(cache: DynamicCache, target_len: int) -> None:
     if target_len == current:
         return
 
-    # 1. Try public cache.crop(target_len)
-    try:
-        cache.crop(target_len)
-        if get_cache_seq_len(cache) == target_len:
-            return
-    except (ValueError, TypeError, Exception):
-        pass
+    diff = current - target_len
 
-    # 2. If cache.crop failed (e.g. transformers version where layer.crop requires negative int),
-    # handle transformers 5.x (layers) and transformers 4.x (key_cache/value_cache)
+    # In modern transformers (5.x+), cache.layers is present.
+    # Some versions require negative tokens_to_remove (-diff), some require target_len.
     if hasattr(cache, "layers") and cache.layers:
-        diff = current - target_len
+        # Try cache-level crop with negative offset first, then target_len
+        for val in [-diff, target_len]:
+            try:
+                cache.crop(val)
+                if get_cache_seq_len(cache) == target_len:
+                    return
+            except Exception:
+                pass
+
+        # Per-layer fallback
         for layer in cache.layers:
             cropped = False
-            # Try negative offset (tokens to remove) then positive target_len
             for val in [-diff, target_len]:
                 try:
                     layer.crop(val)
@@ -88,15 +90,22 @@ def crop_cache(cache: DynamicCache, target_len: int) -> None:
                         break
                 except Exception:
                     pass
-            # Fallback: slice tensor dimensions directly
             if not cropped:
                 if hasattr(layer, "keys") and layer.keys is not None:
                     layer.keys = layer.keys[..., :target_len, :]
                 if hasattr(layer, "values") and layer.values is not None:
                     layer.values = layer.values[..., :target_len, :]
+        return
 
-    elif hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
-        # Transformers 4.x fallback
+    # Transformers 4.x fallback
+    try:
+        cache.crop(target_len)
+        if get_cache_seq_len(cache) == target_len:
+            return
+    except Exception:
+        pass
+
+    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
         for i in range(len(cache.key_cache)):
             if cache.key_cache[i] is not None:
                 cache.key_cache[i] = cache.key_cache[i][..., :target_len, :]
